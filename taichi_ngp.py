@@ -10,15 +10,11 @@ from taichi.math import uvec3, vec3, vec2
 import wget
 import cv2
 import platform
+import shutil
+import os
+import pdb
 
 from typing import Tuple
-
-def depth2img(depth):
-    depth = (depth-depth.min())/(depth.max()-depth.min())
-    depth_img = cv2.applyColorMap((depth*255).astype(np.uint8),
-                                  cv2.COLORMAP_TURBO)
-
-    return depth_img
 
 #arch = ti.cuda if ti._lib.core.with_cuda() else ti.vulkan
 arch = ti.vulkan
@@ -139,77 +135,18 @@ def hash_table_init():
         NGP_hash_map_sizes[i] = params_in_level
         NGP_hash_map_indicator[i] = 1 if resolution ** 3 <= params_in_level else 0
         offset += params_in_level
-
-def get_direction(camera_angle_x):
-    w, h = int(NGP_res[1]), int(NGP_res[0])
-    fx = 0.5*w/np.tan(0.5*camera_angle_x)
-    fy = 0.5*h/np.tan(0.5*camera_angle_x)
-    cx, cy = 0.5*w, 0.5*h
-
-    x, y = np.meshgrid(
-        np.arange(w, dtype=np.float32)+ 0.5,
-        np.arange(h, dtype=np.float32)+ 0.5,
-        indexing='xy'
-    )
-
-    directions = np.stack([(x-cx)/fx, (y-cy)/fy, np.ones_like(x)], -1)
-
-    return directions.reshape(-1, 3)
+    if args.aot:
+        save_np_in_header(NGP_offsets.to_numpy(), 'offsets', 'int')
+        save_np_in_header(NGP_hash_map_sizes.to_numpy(), 'hash_map_sizes', 'unsigned int')
+        save_np_in_header(NGP_hash_map_indicator.to_numpy(), 'hash_map_indicator', 'int')
 
 @ti.kernel
 def init_from_arr(data: ti.types.ndarray(), f: ti.template()):
     for I in ti.grouped(f):
         f[I] = data[I]
 
-#@ti.kernel
-#def init_rgb_weights(data: ti.types.ndarray(dtype=ti.f32, ndim=1)):
-#    for I in ti.grouped(NGP_rgb_weights):
-#        NGP_rgb_weights[I] = data[I]
-
-#@ti.kernel
-#def init_hash_embedding(data: ti.types.ndarray(dtype=ti.f32, ndim=1)):
-#    for I in ti.grouped(NGP_hash_embedding):
-#        NGP_hash_embedding[I] = data[I]
-
-#@ti.kernel
-#def init_sigma_weights(data: ti.types.ndarray(dtype=ti.f32, ndim=1)):
-#    for I in ti.grouped(NGP_sigma_weights):
-#        NGP_sigma_weights[I] = data[I]
-
-# @ti.kernel
-# def init_density_bitfield(data: ti.types.ndarray(dtype=ti.uint32, ndim=1)):
-#     for I in ti.grouped(NGP_density_bitfield):
-#         NGP_density_bitfield[I] = data[I]
-
-# @ti.kernel
-# def init_pose(data: ti.types.ndarray(dtype=ti.types.matrix(3, 4, dtype=ti.f32), ndim=0)):
-#     for I in ti.grouped(NGP_pose):
-#         NGP_pose[I] = data[I]
-
-# @ti.kernel
-# def init_directions(data: ti.types.ndarray(dtype=ti.types.matrix(1, 3, dtype=ti.f32), ndim=1)):
-#     for I in ti.grouped(NGP_directions):
-#         NGP_directions[I] = data[I]
-
-@ti.kernel
-def ext_arr_to_matrix(arr: ti.types.ndarray(), mat: ti.template(),
-                      as_vector: ti.template()):
-    for I in ti.grouped(mat):
-        for p in ti.static(range(mat.n)):
-            for q in ti.static(range(mat.m)):
-                if ti.static(getattr(mat, "ndim", 2) == 1):
-                    if ti.static(as_vector):
-                        mat[I][p] = arr[I, p]
-                    else:
-                        mat[I][p] = arr[I, p, q]
-                else:
-                    if ti.static(as_vector):
-                        mat[I][p, q] = arr[I, p]
-                    else:
-                        mat[I][p, q] = arr[I, p, q]
-
 def save_np_in_header(np_arr, arr_name, arr_type='float'):
-    header_filename = 'compiled/' + arr_name + '.hpp'
+    header_filename = aot_folder + '/' + arr_name + '.hpp'
     with open(header_filename, 'w') as f:
         arr_str = ','.join([str(i) for i in np_arr.flatten()])
         line = f'std::vector<{arr_type}> {arr_name} = {{ {arr_str} }};{os.linesep}'
@@ -218,46 +155,35 @@ def save_np_in_header(np_arr, arr_name, arr_type='float'):
 def load_model(model_path):
     print('Loading model from {}'.format(model_path))
     model = np.load(model_path, allow_pickle=True).item()
-    # model = torch.load(model_path, map_location='cpu')['state_dict']
-    #init_from_arr(model['model.xyz_encoder.params'].astype(np.float), NGP_hash_embedding)
-    #init_from_arr(model['model.xyz_sigmas.params'].astype(np.float), NGP_sigma_weights)
-    #init_from_arr(model['model.rgb_net.params'].astype(np.float), NGP_rgb_weights)
-    #init_from_arr(model['model.density_bitfield'], NGP_density_bitfield)
-    save_np_in_header(model['model.xyz_encoder.params'], 'hash_embedding')
-    save_np_in_header(model['model.xyz_sigmas.params'], 'sigma_weights')
-    save_np_in_header(model['model.rgb_net.params'], 'rgb_weights')
-    save_np_in_header(model['model.density_bitfield'].view("uint32"), 'density_bitfield', 'unsigned int')
     NGP_hash_embedding.from_numpy(model['model.xyz_encoder.params'].astype(np_type))
     NGP_sigma_weights.from_numpy(model['model.xyz_sigmas.params'].astype(np_type))
     NGP_rgb_weights.from_numpy(model['model.rgb_net.params'].astype(np_type))
     NGP_density_bitfield.from_numpy(model['model.density_bitfield'].view("uint32"))
 
-    # init_sigma_weights(model['model.xyz_sigmas.params'].astype(np.float))
-    # init_hash_embedding(model['model.xyz_encoder.params'].astype(np.float))
-    # init_rgb_weights(model['model.rgb_net.params'].astype(np.float))
-    # init_density_bitfield(model['model.density_bitfield'].view("uint32"))
-
-    NGP_pose.from_numpy(model['poses'][20].astype(np_type).reshape(1, 3, 4))
-    #ext_arr_to_matrix(model['poses'][20].astype(np_type), NGP_pose, False)
-    save_np_in_header(model['poses'][20], 'pose')
-    # init_pose(model['poses'][20].astype(np.float).reshape(3, 4))
+    NGP_pose.from_numpy(model['poses'][20].astype(np_type).reshape(3, 4))
     if NGP_res[0] != 800 or NGP_res[1] != 800:
         directions = NGP_get_direction(model['camera_angle_x'])[:, None, :].astype(np_type)
     else:
         directions = model['directions'][:, None, :].astype(np_type)
 
     NGP_directions.from_numpy(directions)
-    # init_directions(directions)
-    #ext_arr_to_matrix(directions, NGP_directions, False)
-    save_np_in_header(model['directions'][:, None, :], 'directions')
+
+    if args.aot:
+        save_np_in_header(model['model.xyz_encoder.params'], 'hash_embedding')
+        save_np_in_header(model['model.xyz_sigmas.params'], 'sigma_weights')
+        save_np_in_header(model['model.rgb_net.params'], 'rgb_weights')
+        save_np_in_header(model['model.density_bitfield'].view("uint32"), 'density_bitfield', 'unsigned int')
+        save_np_in_header(model['poses'][20].astype(np_type).reshape(3, 4), 'pose')
+        save_np_in_header(model['directions'][:, None, :], 'directions')
 
 def taichi_init():
     ti.init(arch=arch, enable_fallback=False, debug=False)
 
 @ti.kernel
-def reset(counter: ti.types.ndarray(dtype=ti.i32, ndim=1), NGP_alive_indices: ti.types.ndarray(ti.i32, ndim=1)):
-    NGP_depth.fill(0.0)
-    NGP_opacity.fill(0.0)
+def reset(counter: ti.types.ndarray(dtype=ti.i32, ndim=1), NGP_alive_indices: ti.types.ndarray(ti.i32, ndim=1), NGP_opacity: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+    # NGP_depth.fill(0.0)
+    for I in ti.grouped(NGP_opacity):
+        NGP_opacity[I] = 0.0
     counter[0] = NGP_N_rays
     for i, j in ti.ndrange(NGP_N_rays, 2):
         NGP_alive_indices[i*2+j] = i
@@ -278,9 +204,14 @@ def _ray_aabb_intersec(ray_o, ray_d):
 
 
 @ti.kernel
-def ray_intersect(NGP_pose: ti.types.ndarray(dtype=ti.types.matrix(3, 4, dtype=ti.f32), ndim=1), NGP_directions: ti.types.ndarray(dtype=ti.types.matrix(1, 3, dtype=ti.f32), ndim=1), NGP_hits_t: ti.types.ndarray(dtype=ti.math.vec2, ndim=1)):
-    for i in NGP_directions:
-        c2w = NGP_pose[0]
+def ray_intersect(NGP_pose: ti.types.ndarray(dtype=ti.types.matrix(3, 4, dtype=ti.f32), ndim=0),
+        NGP_directions: ti.types.ndarray(dtype=ti.types.matrix(1, 3, dtype=ti.f32), ndim=1),
+        NGP_hits_t: ti.types.ndarray(dtype=ti.math.vec2, ndim=1),
+        NGP_rays_o: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_rays_d: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        ):
+    for i in range(800*800):
+        c2w = NGP_pose[None]
         mat_result = NGP_directions[i] @ c2w[:, :3].transpose()
         ray_d = tf_vec3(mat_result[0, 0], mat_result[0, 1],mat_result[0, 2])
         ray_o = c2w[:, 3]
@@ -295,7 +226,20 @@ def ray_intersect(NGP_pose: ti.types.ndarray(dtype=ti.types.matrix(3, 4, dtype=t
         NGP_rays_d[i] = ray_d
 
 @ti.kernel
-def raymarching_test_kernel(counter: ti.types.ndarray(ti.i32, ndim=1), NGP_density_bitfield: ti.types.ndarray(dtype=ti.u32, ndim=1), NGP_hits_t: ti.types.ndarray(dtype=ti.math.vec2, ndim=1), NGP_alive_indices: ti.types.ndarray(dtype=ti.i32, ndim=1), N_samples: int):
+def raymarching_test_kernel(counter: ti.types.ndarray(ti.i32, ndim=1),
+        NGP_density_bitfield: ti.types.ndarray(dtype=ti.u32, ndim=1),
+        NGP_hits_t: ti.types.ndarray(dtype=ti.math.vec2, ndim=1),
+        NGP_alive_indices: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        NGP_rays_o: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_rays_d: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_current_index: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        NGP_xyzs: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_dirs: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_deltas: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_ts: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_run_model_ind: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        NGP_N_eff_samples: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        N_samples: int):
     #NGP_run_model_ind.fill(0)
     for n in ti.ndrange(counter[0]):
         c_index = NGP_current_index[None]
@@ -359,7 +303,11 @@ def raymarching_test_kernel(counter: ti.types.ndarray(ti.i32, ndim=1), NGP_densi
             NGP_alive_indices[n*2+c_index] = -1
 
 @ti.kernel
-def rearange_index(B: ti.i32):
+def rearange_index(NGP_model_launch: ti.types.ndarray(ti.i32, ndim=0),
+        NGP_padd_block_network: ti.types.ndarray(ti.i32, ndim=0),
+        NGP_temp_hit: ti.types.ndarray(ti.i32, ndim=1),
+        NGP_run_model_ind: ti.types.ndarray(ti.i32, ndim=1),
+        B: ti.i32):
     NGP_model_launch[None] = 0
 
     for i in ti.ndrange(B):
@@ -369,12 +317,21 @@ def rearange_index(B: ti.i32):
 
     NGP_model_launch[None] += 1
     NGP_padd_block_network[None] = ((NGP_model_launch[None]+ block_dim - 1)// block_dim) *block_dim
-    # NGP_padd_block_composite[None] = ((NGP_counter[None]+ 128 - 1)// 128) *128
 
 @ti.kernel
-def hash_encode(NGP_hash_embedding: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+def hash_encode(NGP_hash_embedding: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_offsets: ti.types.ndarray(ti.i32, ndim=1),
+        NGP_hash_map_sizes: ti.types.ndarray(ti.u32, ndim=1),
+        NGP_hash_map_indicator: ti.types.ndarray(ti.i32, ndim=1),
+        NGP_model_launch: ti.types.ndarray(ti.i32, ndim=0),
+        NGP_xyzs: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_dirs: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_deltas: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_xyzs_embedding: ti.types.ndarray(dtype=ti.f32, ndim=2),
+        NGP_temp_hit: ti.types.ndarray(ti.i32, ndim=1),
+        ):
     # get hash table embedding
-    ti.loop_config(block_dim=16)
+    # ti.loop_config(block_dim=16)
     for sn, level in ti.ndrange(NGP_model_launch[None], 16):
         # normalize to [0, 1], before is [-0.5, 0.5]
         xyz = NGP_xyzs[NGP_temp_hit[sn]] + 0.5
@@ -429,8 +386,15 @@ def hash_encode(NGP_hash_embedding: ti.types.ndarray(dtype=ti.f32, ndim=1)):
         NGP_xyzs_embedding[sn, level*2+1] = local_feature_1
 
 @ti.kernel
-def sigma_layer(NGP_sigma_weights: ti.types.ndarray(dtype=ti.f32, ndim=1)):
-    ti.loop_config(block_dim=block_dim)
+def sigma_layer(NGP_sigma_weights: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_model_launch: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        NGP_padd_block_network: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        NGP_xyzs_embedding: ti.types.ndarray(dtype=ti.f32, ndim=2),
+        NGP_final_embedding: ti.types.ndarray(dtype=ti.f32, ndim=2),
+        NGP_out_1: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_temp_hit: ti.types.ndarray(ti.i32, ndim=1),
+        ):
+    ti.loop_config(block_dim=block_dim) # DO NOT REMOVE
     for sn in ti.ndrange(NGP_padd_block_network[None]):
         tid = sn % block_dim
         did_launch_num = NGP_model_launch[None]
@@ -471,8 +435,15 @@ def sigma_layer(NGP_sigma_weights: ti.types.ndarray(dtype=ti.f32, ndim=1)):
             ti.simt.block.sync()
 
 @ti.kernel
-def rgb_layer(NGP_rgb_weights: ti.types.ndarray(dtype=ti.f32, ndim=1)):
-    ti.loop_config(block_dim=block_dim)
+def rgb_layer(NGP_rgb_weights: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_model_launch: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        NGP_padd_block_network: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        NGP_dirs: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_final_embedding: ti.types.ndarray(dtype=ti.f32, ndim=2),
+        NGP_out_3: ti.types.ndarray(ti.f32, ndim=2),
+        NGP_temp_hit: ti.types.ndarray(ti.i32, ndim=1),
+        ):
+    ti.loop_config(block_dim=block_dim) # DO NOT REMOVE
     for sn in ti.ndrange(NGP_padd_block_network[None]):
         ray_id = NGP_temp_hit[sn]
         tid = sn % block_dim
@@ -525,7 +496,18 @@ def rgb_layer(NGP_rgb_weights: ti.types.ndarray(dtype=ti.f32, ndim=1)):
 
 
 @ti.kernel
-def composite_test(counter: ti.types.ndarray(dtype=ti.i32, ndim=1), NGP_alive_indices: ti.types.ndarray(dtype=ti.i32, ndim=1), max_samples: ti.i32, T_threshold: data_type):
+def composite_test(counter: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        NGP_alive_indices: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        NGP_rgb: ti.types.ndarray(dtype=ti.math.vec3, ndim=1),
+        NGP_opacity: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_current_index: ti.types.ndarray(ti.i32, ndim=0),
+        NGP_deltas: ti.types.ndarray(ti.f32, ndim=1),
+        NGP_ts: ti.types.ndarray(ti.f32, ndim=1),
+        NGP_out_3: ti.types.ndarray(ti.f32, ndim=2),
+        NGP_out_1: ti.types.ndarray(dtype=ti.f32, ndim=1),
+        NGP_N_eff_samples: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        max_samples: ti.i32,
+        T_threshold: data_type):
     for n in ti.ndrange(counter[0]):
         N_samples = NGP_N_eff_samples[n]
         if N_samples != 0:
@@ -561,16 +543,18 @@ def composite_test(counter: ti.types.ndarray(dtype=ti.i32, ndim=1), NGP_alive_in
 
 
             NGP_rgb[r] += rgb_temp
-            NGP_depth[r] += depth_temp[0]
+            # NGP_depth[r] += depth_temp[0]
             NGP_opacity[r] += opacity_temp[0]
 
 @ti.kernel
-def init_current_index():
+def init_current_index(NGP_current_index: ti.types.ndarray(ti.i32, ndim=0)):
     NGP_current_index[None] = 0
 
 @ti.kernel
-def re_order(counter: ti.types.ndarray(ti.i32, ndim=1), NGP_alive_indices: ti.types.ndarray(dtype=ti.i32, ndim=1), B: ti.i32):
-
+def re_order(counter: ti.types.ndarray(ti.i32, ndim=1),
+        NGP_alive_indices: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        NGP_current_index: ti.types.ndarray(ti.i32, ndim=0),
+        B: ti.i32):
     counter[0] = 0
     c_index = NGP_current_index[None]
     n_index = (c_index + 1) % 2
@@ -585,20 +569,18 @@ def re_order(counter: ti.types.ndarray(ti.i32, ndim=1), NGP_alive_indices: ti.ty
 
 def write_image():
     rgb_np = NGP_rgb.to_numpy().reshape(NGP_res[0], NGP_res[1], 3)
-    depth_np = NGP_depth.to_numpy().reshape(NGP_res[0], NGP_res[1])
     plt.imsave('taichi_ngp.png', (rgb_np*255).astype(np.uint8))
-    plt.imsave('taichi_ngp_depth.png', depth2img(depth_np))
 
 def render(max_samples, T_threshold, use_dof=False, dist_to_focus=0.8, len_dis=0.0) -> Tuple[float, int, int]:
     samples = 0
-    reset(NGP_counter, NGP_alive_indices)
+    reset(NGP_counter, NGP_alive_indices, NGP_opacity)
     print('begin render', NGP_counter[0])
     # gen_noise_buffer()
     if use_dof:
         print('Removed')
         exit(0)
     else:
-        ray_intersect(NGP_pose, NGP_directions, NGP_hits_t)
+        ray_intersect(NGP_pose, NGP_directions, NGP_hits_t, NGP_rays_o, NGP_rays_d)
 
     while samples < max_samples:
         N_alive = NGP_counter[0]
@@ -610,17 +592,65 @@ def render(max_samples, T_threshold, use_dof=False, dist_to_focus=0.8, len_dis=0
         samples += N_samples
         launch_model_total = N_alive * N_samples
 
-        for i in range(NGP_N_rays):
-            print(f'{i}: {NGP_hits_t[i][0]} {NGP_hits_t[i][1]}')
-        raymarching_test_kernel(NGP_counter, NGP_density_bitfield, NGP_hits_t, NGP_alive_indices, N_samples)
-        rearange_index(launch_model_total)
+        raymarching_test_kernel(NGP_counter,
+                NGP_density_bitfield,
+                NGP_hits_t,
+                NGP_alive_indices,
+                NGP_rays_o,
+                NGP_rays_d,
+                NGP_current_index,
+                NGP_xyzs,
+                NGP_dirs,
+                NGP_deltas,
+                NGP_ts,
+                NGP_run_model_ind,
+                NGP_N_eff_samples,
+                N_samples)
+        rearange_index(NGP_model_launch,
+                NGP_padd_block_network,
+                NGP_temp_hit,
+                NGP_run_model_ind,
+                launch_model_total)
         # dir_encode()
-        hash_encode(NGP_hash_embedding)
-        sigma_layer(NGP_sigma_weights)
-        rgb_layer(NGP_rgb_weights)
+        hash_encode(NGP_hash_embedding,
+                NGP_offsets,
+                NGP_hash_map_sizes,
+                NGP_hash_map_indicator,
+                NGP_model_launch,
+                NGP_xyzs,
+                NGP_dirs,
+                NGP_deltas,
+                NGP_xyzs_embedding,
+                NGP_temp_hit)
+        sigma_layer(NGP_sigma_weights,
+                NGP_model_launch,
+                NGP_padd_block_network,
+                NGP_xyzs_embedding,
+                NGP_final_embedding,
+                NGP_out_1,
+                NGP_temp_hit)
+        rgb_layer(NGP_rgb_weights,
+                NGP_model_launch,
+                NGP_padd_block_network,
+                NGP_dirs,
+                NGP_final_embedding,
+                NGP_out_3,
+                NGP_temp_hit)
+
         # FullyFusedMLP()
-        composite_test(NGP_counter, NGP_alive_indices, N_samples, T_threshold)
-        re_order(NGP_counter, NGP_alive_indices, N_alive)
+        composite_test(NGP_counter,
+                NGP_alive_indices,
+                NGP_rgb,
+                NGP_opacity,
+                NGP_current_index,
+                NGP_deltas,
+                NGP_ts,
+                NGP_out_3,
+                NGP_out_1,
+                NGP_N_eff_samples,
+                N_samples,
+                T_threshold)
+        re_order(NGP_counter, NGP_alive_indices, NGP_current_index, N_alive)
 
     return samples, N_alive, N_samples
 
@@ -632,178 +662,7 @@ def render_frame(frame_id):
     print(f"samples: {samples}, N_alive: {N_alive}, N_samples: {N_samples}")
     print(f'Render time: {1000*(time.time()-t):.2f} ms')
 
-@ti.kernel
-def rgb_to_render_buffer(frame: ti.i32):
-    for i, j in NGP_render_buffer:
-        rgb = NGP_rgb[(NGP_res[0]-j)*NGP_res[1]+i]
-        NGP_render_buffer[i, j] = rgb / frame
-
-@ti.kernel
-def depth_max() -> vec2:
-    max_v = NGP_depth[0]
-    min_v = NGP_depth[0]
-    for i in ti.ndrange(NGP_N_rays):
-        ti.atomic_max(max_v, NGP_depth[i])
-        ti.atomic_min(min_v, NGP_depth[i])
-    return vec2(max_v, min_v)
-
-@ti.kernel
-def depth_to_render_buffer(max_min: vec2):
-    for i, j in NGP_render_buffer:
-        max_v = max_min[0]
-        min_v = max_min[1]
-        depth = NGP_depth[(NGP_res[0]-j)*NGP_res[1]+i]
-        pixel = (vec3(depth)-min_v)/(max_v-min_v)
-        NGP_render_buffer[i, j] = pixel
-
-def init_cam():
-    global NGP_lookat
-    NGP_lookat = NGP_lookat @ NGP_pose.to_numpy()[:, :3].T
-
-def render_gui():
-
-    video_manager = None
-
-    # check if the export file exists for snapshot and video
-    export_dir = './export/'
-    if not os.path.exists(export_dir):
-        os.mkdir(export_dir)
-
-    W, H = NGP_res
-    window = ti.ui.Window('Taichi NGP', (W, H))
-    canvas = window.get_canvas()
-    gui = window.get_gui()
-
-    last_mouse_x = None
-    last_mouse_y = None
-    rotate_speed = 50
-    movement_speed = 0.03
-    max_samples_for_rendering = 100
-    render_time = 0
-    # white_bg = False
-    recording = False
-    show_depth = False
-    use_dof = False
-    last_use_dof = False
-    frame = 0
-    T_threshold = 1e-2
-    dist_to_focus = 1.2
-    len_dis=0.04
-    init_cam()
-    last_pose = NGP_pose.to_numpy()
-    total_frame = 0
-    last_dist_to_focus = dist_to_focus
-    last_len_dis = len_dis
-    global NGP_lookat
-
-    while window.running:
-        # TODO: make it more efficient
-        pose = NGP_pose.to_numpy()
-        total_frame+=1
-        if not window.is_pressed(ti.ui.RMB):
-            last_mouse_x = None
-            last_mouse_y = None
-        else:
-            curr_mouse_x, curr_mouse_y = window.get_cursor_pos()
-            if last_mouse_x is None or last_mouse_y is None:
-                last_mouse_x, last_mouse_y = curr_mouse_x, curr_mouse_y
-            else:
-                dx = curr_mouse_x - last_mouse_x
-                dy = curr_mouse_y - last_mouse_y
-                rotvec_x = pose[:, 1] * np.radians(rotate_speed * dx)
-                rotvec_y = pose[:, 0] * np.radians(rotate_speed * dy)
-                pose = R.from_rotvec(rotvec_x).as_matrix() @ R.from_rotvec(rotvec_y).as_matrix() @ pose
-                last_mouse_x, last_mouse_y = curr_mouse_x, curr_mouse_y
-                correct_dir = 1. if pose[2, 3] < 0.0 else -1.
-                NGP_lookat = np.array([0., 0., correct_dir]) @ pose[:, :3].T
-
-        front = (NGP_lookat - pose[:, 3])
-        front = front / np.linalg.norm(front)
-        up = NGP_lookup @ pose[:, :3].T
-        left = np.cross(up, front)
-        position_change = np.zeros(3)
-        if window.is_pressed('w'):
-            position_change = front * movement_speed
-        if window.is_pressed('s'):
-            position_change = -front * movement_speed
-        if window.is_pressed('a'):
-            position_change = left * movement_speed
-        if window.is_pressed('d'):
-            position_change = -left * movement_speed
-        if window.is_pressed('e'):
-            position_change = up * movement_speed
-        if window.is_pressed('q'):
-            position_change = -up * movement_speed
-        pose[:, 3] += position_change
-        NGP_lookat += position_change
-        if (last_pose - pose).sum():
-            last_pose = pose
-            NGP_pose.from_numpy(pose.astype(np.float16))
-            NGP_rgb.fill(0.0)
-            total_frame = 1
-
-        with gui.sub_window("Options", 0.05, 0.05, 0.68, 0.3) as w:
-            w.text(f'General')
-            T_threshold = w.slider_float('transparency threshold', T_threshold, 0., 1.)
-            max_samples_for_rendering = w.slider_float("max samples", max_samples_for_rendering, 1, 100)
-            show_depth = w.checkbox("show depth", show_depth)
-            # white_bg = w.checkbox("white background", white_bg)
-
-            w.text(f'Camera')
-            use_dof = w.checkbox("apply depth of field", use_dof)
-            dist_to_focus = w.slider_float("focus distance", dist_to_focus, 0.8, 3.)
-            len_dis = w.slider_float('lens size', len_dis, 0., 0.1)
-            if last_dist_to_focus != dist_to_focus or last_len_dis != len_dis or last_use_dof != use_dof:
-                last_dist_to_focus = dist_to_focus
-                last_len_dis = len_dis
-                last_use_dof = use_dof
-                NGP_rgb.fill(0.0)
-                total_frame = 1
-
-            w.text(f'Render time: {render_time:.2f} ms')
-
-        with gui.sub_window("Export", 0.75, 0.05, 0.2, 0.1) as w:
-            if gui.button("snapshot "):
-                ti.tools.imwrite(NGP_render_buffer.to_numpy(), export_dir+'snap_shot.png')
-                print("save snapshot in export folder")
-            if gui.button('recording'):
-                frame = 0
-                if not recording:
-                    video_manager = ti.tools.VideoManager(output_dir=export_dir, framerate=24, automatic_build=False)
-                    recording = True
-                else:
-                    recording = False
-                    video_manager.make_video(gif=True, mp4=True)
-                    print("save video in export folder")
-
-            if recording and video_manager:
-                w.text(f'recording frames: {frame}')
-                frame += 1
-                pixels_img = NGP_render_buffer.to_numpy()
-                video_manager.write_frame(pixels_img)
-
-        t = time.time()
-        _, _, _ = render(
-            max_samples=max_samples_for_rendering,
-            T_threshold=T_threshold,
-            use_dof=use_dof,
-            dist_to_focus=dist_to_focus,
-            len_dis=len_dis,
-        )
-
-        if not show_depth:
-            rgb_to_render_buffer(total_frame)
-        else:
-            depth_to_render_buffer(NGP_depth_max())
-
-        render_time = 1000*(time.time()-t)
-        canvas.set_image(NGP_render_buffer)
-        window.show()
-
-
 def main(args):
-
-
     if args.model_path:
         load_model(args.model_path)
     else:
@@ -832,28 +691,9 @@ def main(args):
         m.add_kernel(re_order)
         m.add_kernel(fill_ndarray)
         m.add_kernel(init_current_index)
-        # m.add_kernel(init_hash_embedding)
-        # m.add_kernel(init_sigma_weights)
-        # m.add_kernel(init_rgb_weights)
-        # m.add_kernel(init_density_bitfield)
-        # m.add_kernel(init_pose)
-        # m.add_kernel(init_directions)
 
-        m.add_field('rgb', NGP_rgb)
-        #m.add_field('pose', NGP_pose)
-        #m.add_field('hash_embedding', NGP_hash_embedding)
-        #m.add_field('sigma_weights', NGP_sigma_weights)
-        #m.add_field('rgb_weights', NGP_rgb_weights)
-        #m.add_field('density_bitfield', NGP_density_bitfield)
-        #m.add_field('directions', NGP_directions)
-
-        #with m.add_kernel_template(init_from_arr) as kt:
-        #    kt.instantiate(f=NGP_rgb_weights)
-        #    kt.instantiate(n=)
-        #    kt.instantiate(n=)
-        #    kt.instantiate(n=)
-
-        m.save('compiled')
+        m.save(aot_folder)
+        print(f'Saved to {aot_folder}')
         return
 
     if not args.gui:
@@ -876,6 +716,10 @@ if __name__ == '__main__':
     parser.add_argument('--gui', action='store_true', default=False)
     parser.add_argument('--aot', action='store_true', default=False)
     args = parser.parse_args()
+    if args.aot:
+        aot_folder = '/home/ailing/github/taichi-aot-demo/8_nerf/assets/tutorial'
+        shutil.rmtree(aot_folder)
+        os.mkdir(aot_folder)
     taichi_init()
 
     res = args.res
@@ -903,36 +747,31 @@ if __name__ == '__main__':
     NGP_xyz_max = tf_vec3(scale, scale, scale)
     NGP_half_size = (NGP_xyz_max - NGP_xyz_min) / 2
 
-    NGP_noise_buffer = ti.Vector.field(2, dtype=data_type, shape=(NGP_N_rays))
-
-    NGP_rays_o = ti.Vector.field(n=3, dtype=data_type, shape=(NGP_N_rays))
-    NGP_rays_d = ti.Vector.field(n=3, dtype=data_type, shape=(NGP_N_rays))
-
+    NGP_rays_o = ti.Vector.ndarray(n=3, dtype=data_type, shape=(NGP_N_rays))
+    NGP_rays_d = ti.Vector.ndarray(n=3, dtype=data_type, shape=(NGP_N_rays))
     # use the pre-compute direction and scene pose
     NGP_directions = ti.Matrix.ndarray(n=1, m=3, dtype=ti.f32, shape=(NGP_N_rays,))
-    NGP_pose = ti.Matrix.ndarray(n=3, m=4, dtype=ti.f32, shape=(1))
+    NGP_pose = ti.Matrix.ndarray(n=3, m=4, dtype=ti.f32, shape=())
 
     # density_bitfield is used for point sampling
     NGP_density_bitfield = ti.ndarray(ti.uint32, shape=(cascades*grid_size**3//32))
 
     # count the number of rays that still alive
-    #NGP_counter = ti.field(ti.i32, shape=())
     NGP_counter = ti.ndarray(ti.i32, shape=(1,))
     NGP_counter[0] = NGP_N_rays
     # current alive buffer index
-    NGP_current_index = ti.field(ti.i32, shape=())
+    NGP_current_index = ti.ndarray(ti.i32, shape=())
     # NGP_current_index[None] = 0
-    init_current_index()
+    init_current_index(NGP_current_index)
 
     # how many samples that need to run the model
-    NGP_model_launch = ti.field(ti.i32, shape=())
+    NGP_model_launch = ti.ndarray(ti.i32, shape=())
 
     # buffer for the alive rays
     NGP_alive_indices = ti.ndarray(ti.i32, shape=(2*NGP_N_rays,))
 
     # padd the thread to the factor of block size (thread per block)
-    NGP_padd_block_network = ti.field(ti.i32, shape=())
-    NGP_padd_block_composite = ti.field(ti.i32, shape=())
+    NGP_padd_block_network = ti.ndarray(ti.i32, shape=())
 
     # hash table variables
     NGP_min_samples = 1 if exp_step_factor==0 else 4
@@ -941,9 +780,9 @@ if __name__ == '__main__':
     NGP_max_params = 2**log2_T
     NGP_level = level
     # hash table fields
-    NGP_offsets = ti.field(ti.i32, shape=(16,))
-    NGP_hash_map_sizes = ti.field(ti.uint32, shape=(16,))
-    NGP_hash_map_indicator = ti.field(ti.i32, shape=(16,))
+    NGP_offsets = ti.ndarray(ti.i32, shape=(16,))
+    NGP_hash_map_sizes = ti.ndarray(ti.uint32, shape=(16,))
+    NGP_hash_map_indicator = ti.ndarray(ti.i32, shape=(16,))
 
     # model parameters
     layer1_base = 32 * 64
@@ -956,31 +795,24 @@ if __name__ == '__main__':
     NGP_max_samples_per_rays = 1
     NGP_max_samples_shape = NGP_N_rays * NGP_max_samples_per_rays
 
-    NGP_xyzs = ti.Vector.field(3, dtype=data_type, shape=(NGP_max_samples_shape,))
-    NGP_dirs = ti.Vector.field(3, dtype=data_type, shape=(NGP_max_samples_shape,))
-    NGP_deltas = ti.field(data_type, shape=(NGP_max_samples_shape,))
-    NGP_ts = ti.field(data_type, shape=(NGP_max_samples_shape,))
+    NGP_xyzs = ti.Vector.ndarray(3, dtype=data_type, shape=(NGP_max_samples_shape,))
+    NGP_dirs = ti.Vector.ndarray(3, dtype=data_type, shape=(NGP_max_samples_shape,))
+    NGP_deltas = ti.ndarray(data_type, shape=(NGP_max_samples_shape,))
+    NGP_ts = ti.ndarray(data_type, shape=(NGP_max_samples_shape,))
 
     # buffers that store the info of sampled points
-    NGP_run_model_ind = ti.field(ti.int32, shape=(NGP_max_samples_shape,))
-    NGP_N_eff_samples = ti.field(ti.int32, shape=(NGP_N_rays,))
+    NGP_run_model_ind = ti.ndarray(ti.int32, shape=(NGP_max_samples_shape,))
+    NGP_N_eff_samples = ti.ndarray(ti.int32, shape=(NGP_N_rays,))
 
     # intermediate buffers for network
-    NGP_xyzs_embedding = ti.field(data_type, shape=(NGP_max_samples_shape, 32))
-    NGP_final_embedding = ti.field(data_type, shape=(NGP_max_samples_shape, 16))
-    NGP_out_3 = ti.field(data_type, shape=(NGP_max_samples_shape, 3))
-    NGP_out_1 = ti.field(data_type, shape=(NGP_max_samples_shape,))
-    NGP_temp_hit = ti.field(ti.i32, shape=(NGP_max_samples_shape,))
+    NGP_xyzs_embedding = ti.ndarray(data_type, shape=(NGP_max_samples_shape, 32))
+    NGP_final_embedding = ti.ndarray(data_type, shape=(NGP_max_samples_shape, 16))
+    NGP_out_3 = ti.ndarray(data_type, shape=(NGP_max_samples_shape, 3))
+    NGP_out_1 = ti.ndarray(data_type, shape=(NGP_max_samples_shape,))
+    NGP_temp_hit = ti.ndarray(ti.i32, shape=(NGP_max_samples_shape,))
 
     # results buffers
-    NGP_opacity = ti.field(ti.f32, shape=(NGP_N_rays,))
-    NGP_depth = ti.field(ti.f32, shape=(NGP_N_rays))
-    NGP_rgb = ti.Vector.field(3, dtype=ti.f32, shape=(NGP_N_rays,))
+    NGP_opacity = ti.ndarray(ti.f32, shape=(NGP_N_rays,))
+    NGP_rgb = ti.Vector.ndarray(3, dtype=ti.f32, shape=(NGP_N_rays,))
 
-    # GUI render buffer (data type must be float32)
-    NGP_render_buffer = ti.Vector.field(3, dtype=ti.f32, shape=(res[0], res[1],))
-    # camera parameters
-    NGP_lookat = np.array([0.0, 0.0, -1.0])
-    NGP_lookat_change = np.zeros((3,))
-    NGP_lookup = np.array([0.0, -1.0, 0.0])
     main(args)
